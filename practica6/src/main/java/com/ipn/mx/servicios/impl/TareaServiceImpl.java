@@ -24,7 +24,6 @@ public class TareaServiceImpl implements TareaService {
     @Override
     @Transactional
     public Tarea save(Tarea tarea) {
-        // Si viene owner con solo id (o null), intentamos resolver el usuario para relacionarlo
         if (tarea.getOwner() != null && tarea.getOwner().getId() != null) {
             Optional<Usuario> optUser = usuarioRepository.findById(tarea.getOwner().getId());
             optUser.ifPresent(tarea::setOwner);

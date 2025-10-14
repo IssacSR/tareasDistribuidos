@@ -56,7 +56,6 @@ public class TareaController {
 
         t.setTitulo(tarea.getTitulo());
         t.setCompletada(tarea.getCompletada());
-        // Si viene owner con id, se intentará resolver en el servicio antes de guardar
         t.setOwner(tarea.getOwner());
 
         return service.save(t);

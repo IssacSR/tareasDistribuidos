@@ -1,10 +1,12 @@
 // app.js - UI mínimo + IndexedDB outbox + sync
 // Backend esperado:
-// GET  /api/tareas            -> lista de tareas
-// POST /api/tareas           -> crear tarea (acepta clientId opcional)
-// PATCH/PUT /api/tareas/{id} -> actualizar tarea
-// DELETE /api/tareas/{id}    -> eliminar tarea
+// GET  ${API_BASE}/tareas            -> lista de tareas
+// POST ${API_BASE}/tareas           -> crear tarea (acepta clientId opcional)
+// PUT  ${API_BASE}/tareas/{id}      -> actualizar tarea (opcional)
+// PUT  ${API_BASE}/tareas/{id}/completada -> actualizar completada
+// DELETE ${API_BASE}/tareas/{id}    -> eliminar tarea
 
+const API_BASE = '/apiTarea';
 const dbName = 'agenda-db';
 const dbVersion = 1;
 
@@ -104,24 +106,28 @@ function renderTasks(tasks) {
         tasksEl.appendChild(div);
     });
 }
-
 function escapeHtml(s){ return (s||'').toString().replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
-
+// ---------- API wrapper ----------
 async function apiFetch(path, opts = {}) {
-    const res = await fetch(path, Object.assign({ headers: { 'Content-Type': 'application/json' } }, opts));
+    const method = opts.method || 'GET';
+    const fetchOpts = { method, headers: {} };
+    if (opts.body !== undefined && opts.body !== null) {
+        fetchOpts.headers['Content-Type'] = 'application/json';
+        fetchOpts.body = opts.body;
+    }
+    const res = await fetch(path, fetchOpts);
     if (!res.ok) throw new Error('API error ' + res.status);
     const text = await res.text();
     return text ? JSON.parse(text) : null;
 }
 
+// ---------- Sync logic ----------
 async function refreshTasks() {
     try {
-        const serverTasks = await apiFetch('/api/tareas');
-        // normalize and store in IndexedDB
+        const serverTasks = await apiFetch(`${API_BASE}/tareas`);
         await clearTasksDB();
         for (const s of serverTasks) {
-            // Map server id to task object expected by UI
             const task = {
                 id: s.idTarea || s.id || generateUuidShort(),
                 titulo: s.titulo,
@@ -139,38 +145,40 @@ async function refreshTasks() {
     }
 }
 
-
 async function syncOutbox() {
     const out = await getOutbox();
     if (!out.length) {
-        // if nothing to sync, ensure latest tasks from server
         if (navigator.onLine) await refreshTasks();
         return;
     }
     for (const op of out) {
         try {
+            // Build fetch options: only include body when necessary
             if (op.method === 'POST') {
                 const res = await apiFetch(op.url, { method: 'POST', body: JSON.stringify(op.body) });
-
                 if (res && res.idTarea) {
                     await replaceLocalTaskId(op.body.id, res.idTarea, res);
                 }
+            } else if (op.method === 'PUT') {
+                // PUT for completada or full update - op.body may be null for some deletes (but here it's PUT so body expected)
+                await apiFetch(op.url, { method: 'PUT', body: JSON.stringify(op.body) });
+            } else if (op.method === 'DELETE') {
+                // Do not send body with DELETE
+                await apiFetch(op.url, { method: 'DELETE' });
             } else {
-                await apiFetch(op.url, { method: op.method, body: JSON.stringify(op.body) });
+                // fallback
+                await apiFetch(op.url, { method: op.method, body: op.body ? JSON.stringify(op.body) : null });
             }
         } catch (err) {
             console.error('Fallo al sincronizar operación', op, err);
-
-            return;
+            return; // stop on first failure
         }
     }
-    // If all succeeded:
     await clearOutbox();
     await refreshTasks();
 }
 
 async function replaceLocalTaskId(clientId, serverId, serverTask) {
-
     const db = await openDB();
     const tx = db.transaction('tasks', 'readwrite');
     const store = tx.objectStore('tasks');
@@ -180,10 +188,9 @@ async function replaceLocalTaskId(clientId, serverId, serverTask) {
         if (local) {
             local.id = serverId;
             delete local.clientId;
-
             if (serverTask.titulo) local.titulo = serverTask.titulo;
             if (serverTask.completada !== undefined) local.completada = serverTask.completada;
-            await store.delete(clientId);
+            store.delete(clientId);
             store.put(local);
         }
     };
@@ -203,25 +210,24 @@ document.getElementById('form').addEventListener('submit', async e => {
         titulo: title,
         completada: false,
         createdAt: Date.now(),
-        clientId // mark as created offline
+        clientId
     };
     await putTaskToDB(task);
     renderTasks(await getAllTasksFromDB());
 
     try {
         if (navigator.onLine) {
-            const res = await apiFetch('/api/tareas', { method: 'POST', body: JSON.stringify(task) });
-            // server may return created entity; replace local id
+            const res = await apiFetch(`${API_BASE}/tareas`, { method: 'POST', body: JSON.stringify(task) });
             if (res && res.idTarea) await replaceLocalTaskId(clientId, res.idTarea, res);
             await refreshTasks();
         } else {
-            await addToOutbox({ method: 'POST', url: '/api/tareas', body: task });
+            await addToOutbox({ method: 'POST', url: `${API_BASE}/tareas`, body: task });
             infoEl.textContent = 'Tarea creada localmente y pendiente de sincronizar';
             tryRegisterSync();
         }
     } catch (err) {
         console.warn('Creación falló, guardando en outbox', err);
-        await addToOutbox({ method: 'POST', url: '/api/tareas', body: task });
+        await addToOutbox({ method: 'POST', url: `${API_BASE}/tareas`, body: task });
         infoEl.textContent = 'Tarea creada localmente y pendiente de sincronizar';
         tryRegisterSync();
     }
@@ -231,7 +237,6 @@ tasksEl.addEventListener('change', async e => {
     if (!e.target.matches('input[type="checkbox"]')) return;
     const id = e.target.dataset.id;
     const completed = e.target.checked;
-    // update local
     const db = await openDB();
     const tx = db.transaction('tasks', 'readwrite');
     const store = tx.objectStore('tasks');
@@ -242,12 +247,14 @@ tasksEl.addEventListener('change', async e => {
         t.completada = completed;
         await store.put(t);
         renderTasks(await getAllTasksFromDB());
-        // send to server or queue
-        const url = `/api/tareas/${id}`;
-        const op = { method: 'PATCH', url, body: { completada: completed } };
+
+        // Use the completada endpoint your controller exposes
+        const url = `${API_BASE}/tareas/${id}/completada`;
+        const op = { method: 'PUT', url, body: { completada: completed } };
+
         try {
             if (navigator.onLine) {
-                await apiFetch(url, { method: 'PATCH', body: JSON.stringify(op.body) });
+                await apiFetch(url, { method: 'PUT', body: JSON.stringify(op.body) });
                 await refreshTasks();
             } else {
                 await addToOutbox(op);
@@ -265,14 +272,13 @@ tasksEl.addEventListener('change', async e => {
 tasksEl.addEventListener('click', async e => {
     if (!e.target.matches('button[data-delete]')) return;
     const id = e.target.getAttribute('data-delete');
-    // remove locally
     const db = await openDB();
     const tx = db.transaction('tasks', 'readwrite');
     tx.objectStore('tasks').delete(id);
     await tx.complete;
     renderTasks(await getAllTasksFromDB());
-    // delete on server or queue
-    const op = { method: 'DELETE', url: `/api/tareas/${id}`, body: null };
+
+    const op = { method: 'DELETE', url: `${API_BASE}/tareas/${id}`, body: null };
     try {
         if (navigator.onLine) {
             await apiFetch(op.url, { method: 'DELETE' });
@@ -320,9 +326,7 @@ async function tryRegisterSync() {
     }
 }
 
-
 refreshTasks();
-
 
 function generateUuidShort() {
     return 'c-' + Math.random().toString(36).slice(2, 9);

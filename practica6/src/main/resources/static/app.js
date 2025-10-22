@@ -10,6 +10,9 @@ const API_BASE = '/apiTarea';
 const dbName = 'agenda-db';
 const dbVersion = 1;
 
+// Evita sincronizaciones concurrentes
+let syncInProgress = false;
+
 // ---------- IndexedDB helpers ----------
 // Helper: wait a transaction complete (robusto)
 function waitTxComplete(tx) {
@@ -154,34 +157,71 @@ async function refreshTasks() {
     }
 }
 
+// Nueva syncOutbox: procesa item por item y elimina cada entrada al confirmarse
 async function syncOutbox() {
-    const out = await getOutbox();
-    if (!out.length) {
-        if (navigator.onLine) await refreshTasks();
+    if (syncInProgress) {
+        console.log('syncOutbox: ya hay una sincronización en progreso, se ignora la nueva llamada.');
         return;
     }
-    for (const op of out) {
-        try {
-            if (op.method === 'POST') {
-                const res = await apiFetch(op.url, { method: 'POST', body: JSON.stringify(op.body) });
-                if (res && (res.idTarea || res.id)) {
-                    const serverId = res.idTarea || res.id;
-                    await replaceLocalTaskId(op.body.clientId || op.body.id, serverId, res);
-                }
-            } else if (op.method === 'PUT') {
-                await apiFetch(op.url, { method: 'PUT', body: JSON.stringify(op.body) });
-            } else if (op.method === 'DELETE') {
-                await apiFetch(op.url, { method: 'DELETE' });
-            } else {
-                await apiFetch(op.url, { method: op.method, body: op.body ? JSON.stringify(op.body) : null });
-            }
-        } catch (err) {
-            console.error('Fallo al sincronizar operación', op, err);
+    syncInProgress = true;
+    try {
+        const db = await openDB();
+
+        // Leer items y keys para borrar por key
+        const txRead = db.transaction('outbox', 'readonly');
+        const storeRead = txRead.objectStore('outbox');
+        const itemsReq = storeRead.getAll();
+        const keysReq = storeRead.getAllKeys();
+        await new Promise((res, rej) => {
+            itemsReq.onsuccess = () => {
+                keysReq.onsuccess = () => res();
+                keysReq.onerror = () => rej(keysReq.error);
+            };
+            itemsReq.onerror = () => rej(itemsReq.error);
+        });
+        const items = itemsReq.result || [];
+        const keys = keysReq.result || [];
+
+        if (!items.length) {
+            if (navigator.onLine) await refreshTasks();
             return;
         }
+
+        // Procesar secuencialmente; eliminar cada entrada al procesarla
+        for (let i = 0; i < items.length; i++) {
+            const op = items[i];
+            const key = keys[i];
+            try {
+                if (op.method === 'POST') {
+                    const res = await apiFetch(op.url, { method: 'POST', body: JSON.stringify(op.body) });
+                    const serverId = res && (res.idTarea || res.id || res.id_tarea);
+                    if (serverId) {
+                        await replaceLocalTaskId(op.body.clientId || op.body.id, serverId, res);
+                    }
+                } else if (op.method === 'PUT') {
+                    await apiFetch(op.url, { method: 'PUT', body: JSON.stringify(op.body) });
+                } else if (op.method === 'DELETE') {
+                    await apiFetch(op.url, { method: 'DELETE' });
+                } else {
+                    await apiFetch(op.url, { method: op.method, body: op.body ? JSON.stringify(op.body) : null });
+                }
+
+                // borrar la entrada procesada
+                const txDel = db.transaction('outbox', 'readwrite');
+                txDel.objectStore('outbox').delete(key);
+                await waitTxComplete(txDel);
+            } catch (err) {
+                console.error('Fallo al sincronizar operación', op, err);
+                // detener para reintento posterior; no borramos la operación fallida
+                return;
+            }
+        }
+
+        // refrescar datos desde servidor al terminar
+        await refreshTasks();
+    } finally {
+        syncInProgress = false;
     }
-    await clearOutbox();
-    await refreshTasks();
 }
 
 async function replaceLocalTaskId(clientId, serverId, serverTask) {

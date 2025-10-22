@@ -11,6 +11,15 @@ const dbName = 'agenda-db';
 const dbVersion = 1;
 
 // ---------- IndexedDB helpers ----------
+// Helper: wait a transaction complete (robusto)
+function waitTxComplete(tx) {
+    return new Promise((resolve, reject) => {
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error || new Error('IDB transaction error'));
+        tx.onabort = () => reject(tx.error || new Error('IDB transaction aborted'));
+    });
+}
+
 function openDB() {
     return new Promise((res, rej) => {
         const req = indexedDB.open(dbName, dbVersion);
@@ -28,7 +37,7 @@ async function putTaskToDB(task) {
     const db = await openDB();
     const tx = db.transaction('tasks', 'readwrite');
     tx.objectStore('tasks').put(task);
-    return tx.complete;
+    return waitTxComplete(tx);
 }
 
 async function getAllTasksFromDB() {
@@ -44,7 +53,7 @@ async function clearTasksDB() {
     const db = await openDB();
     const tx = db.transaction('tasks', 'readwrite');
     tx.objectStore('tasks').clear();
-    return tx.complete;
+    return waitTxComplete(tx);
 }
 
 // Outbox
@@ -52,7 +61,7 @@ async function addToOutbox(op) {
     const db = await openDB();
     const tx = db.transaction('outbox', 'readwrite');
     tx.objectStore('outbox').add(op);
-    return tx.complete;
+    return waitTxComplete(tx);
 }
 
 async function getOutbox() {
@@ -68,7 +77,7 @@ async function clearOutbox() {
     const db = await openDB();
     const tx = db.transaction('outbox', 'readwrite');
     tx.objectStore('outbox').clear();
-    return tx.complete;
+    return waitTxComplete(tx);
 }
 
 // ---------- UI ----------
@@ -153,25 +162,22 @@ async function syncOutbox() {
     }
     for (const op of out) {
         try {
-            // Build fetch options: only include body when necessary
             if (op.method === 'POST') {
                 const res = await apiFetch(op.url, { method: 'POST', body: JSON.stringify(op.body) });
-                if (res && res.idTarea) {
-                    await replaceLocalTaskId(op.body.id, res.idTarea, res);
+                if (res && (res.idTarea || res.id)) {
+                    const serverId = res.idTarea || res.id;
+                    await replaceLocalTaskId(op.body.clientId || op.body.id, serverId, res);
                 }
             } else if (op.method === 'PUT') {
-                // PUT for completada or full update - op.body may be null for some deletes (but here it's PUT so body expected)
                 await apiFetch(op.url, { method: 'PUT', body: JSON.stringify(op.body) });
             } else if (op.method === 'DELETE') {
-                // Do not send body with DELETE
                 await apiFetch(op.url, { method: 'DELETE' });
             } else {
-                // fallback
                 await apiFetch(op.url, { method: op.method, body: op.body ? JSON.stringify(op.body) : null });
             }
         } catch (err) {
             console.error('Fallo al sincronizar operación', op, err);
-            return; // stop on first failure
+            return;
         }
     }
     await clearOutbox();
@@ -194,7 +200,7 @@ async function replaceLocalTaskId(clientId, serverId, serverTask) {
             store.put(local);
         }
     };
-    return tx.complete;
+    return waitTxComplete(tx);
 }
 
 // ---------- UI actions (create, toggle, delete) ----------
@@ -215,19 +221,28 @@ document.getElementById('form').addEventListener('submit', async e => {
     await putTaskToDB(task);
     renderTasks(await getAllTasksFromDB());
 
+    // prepare payload for server (omit id/clientId to avoid binding issues)
+    const payload = {
+        titulo: task.titulo,
+        completada: task.completada
+        // if you need owner: owner: { idUsuario: 1 } // adjust to your API
+    };
+
     try {
         if (navigator.onLine) {
-            const res = await apiFetch(`${API_BASE}/tareas`, { method: 'POST', body: JSON.stringify(task) });
-            if (res && res.idTarea) await replaceLocalTaskId(clientId, res.idTarea, res);
+            const res = await apiFetch(`${API_BASE}/tareas`, { method: 'POST', body: JSON.stringify(payload) });
+            const serverId = res && (res.idTarea || res.id || res.id_tarea);
+            if (serverId) await replaceLocalTaskId(clientId, serverId, res);
             await refreshTasks();
         } else {
-            await addToOutbox({ method: 'POST', url: `${API_BASE}/tareas`, body: task });
+            // store an operation that includes clientId so we can reconcile later
+            await addToOutbox({ method: 'POST', url: `${API_BASE}/tareas`, body: Object.assign({}, payload, { clientId }) });
             infoEl.textContent = 'Tarea creada localmente y pendiente de sincronizar';
             tryRegisterSync();
         }
     } catch (err) {
         console.warn('Creación falló, guardando en outbox', err);
-        await addToOutbox({ method: 'POST', url: `${API_BASE}/tareas`, body: task });
+        await addToOutbox({ method: 'POST', url: `${API_BASE}/tareas`, body: Object.assign({}, payload, { clientId }) });
         infoEl.textContent = 'Tarea creada localmente y pendiente de sincronizar';
         tryRegisterSync();
     }
@@ -248,7 +263,6 @@ tasksEl.addEventListener('change', async e => {
         await store.put(t);
         renderTasks(await getAllTasksFromDB());
 
-        // Use the completada endpoint your controller exposes
         const url = `${API_BASE}/tareas/${id}/completada`;
         const op = { method: 'PUT', url, body: { completada: completed } };
 
@@ -275,7 +289,7 @@ tasksEl.addEventListener('click', async e => {
     const db = await openDB();
     const tx = db.transaction('tasks', 'readwrite');
     tx.objectStore('tasks').delete(id);
-    await tx.complete;
+    await waitTxComplete(tx);
     renderTasks(await getAllTasksFromDB());
 
     const op = { method: 'DELETE', url: `${API_BASE}/tareas/${id}`, body: null };

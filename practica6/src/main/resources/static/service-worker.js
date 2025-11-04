@@ -10,7 +10,7 @@ const PRECACHE_URLS = [
     '/icons/icon-512.png'
 ];
 
-// API bases the SW will treat as API requests
+// API bases
 const API_BASES = ['/api/', '/apiTarea/'];
 
 self.addEventListener('install', event => {

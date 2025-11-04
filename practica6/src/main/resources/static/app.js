@@ -10,11 +10,11 @@ const API_BASE = '/apiTarea';
 const dbName = 'agenda-db';
 const dbVersion = 1;
 
-// Evita sincronizaciones concurrentes
+
 let syncInProgress = false;
 
 // ---------- IndexedDB helpers ----------
-// Helper: wait a transaction complete (robusto)
+
 function waitTxComplete(tx) {
     return new Promise((resolve, reject) => {
         tx.oncomplete = () => resolve();
